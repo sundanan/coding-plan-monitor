@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=火山方舟用量监控
+Comment=Monitor Volcengine Ark Coding Plan usage
+Exec=/usr/bin/python3 /home/sun/volc-ark-monitor/volc_ark_monitor.py
+Path=/home/sun/volc-ark-monitor
+Icon=/home/sun/volc-ark-monitor/icon.png
+Terminal=false
+Categories=Utility;
+StartupNotify=false

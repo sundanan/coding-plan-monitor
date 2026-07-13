@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+config.json
+monitor.log
+*.log
+.venv/
+venv/
+env/
+.Python
+*.swp
+*.swo
+*~
+.DS_Store
