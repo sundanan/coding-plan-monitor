@@ -392,6 +392,7 @@ def _build_kimi_period(name, level, used, limit, reset_time, total_seconds):
         "reset_time": reset_time,
         "remaining_seconds": max(rem_sec, 0),
         "total_seconds": total_seconds,
+        "limit": limit, "used": used,
     }
 
 
@@ -417,6 +418,16 @@ def _fetch_kimi_usage():
     now = datetime.now()
     periods = {}
 
+    # Main plan quota (weekly cycle per observed resetTime ~7d): top-level usage.
+    # Built first so its remaining can cap the 5h window (a 5h window can never
+    # have more quota left than the weekly plan it draws from).
+    usage = data.get("usage", {}) or {}
+    if usage:
+        reset_time = _parse_kimi_time(usage.get("resetTime"))
+        periods["weekly"] = _build_kimi_period(
+            "本周", "weekly", usage.get("used", "0"), usage.get("limit", "0"),
+            reset_time, 7 * 24 * 3600)
+
     # 5h rolling window: limits[].window with duration in minutes.
     for item in data.get("limits", []) or []:
         window = item.get("window", {}) or {}
@@ -427,19 +438,28 @@ def _fetch_kimi_usage():
         detail = item.get("detail", {}) or {}
         limit = detail.get("limit", "0")
         remaining = detail.get("remaining", "0")
-        used = str(int(limit) - int(remaining)) if limit not in (None, "") else "0"
+        limit_int = int(limit) if limit not in (None, "") else 0
+        remaining_int = int(remaining) if remaining not in (None, "") else 0
         reset_time = _parse_kimi_time(detail.get("resetTime"))
-        periods["session"] = _build_kimi_period(
-            "近5小时", "session", used, limit, reset_time, 5 * 3600)
-        break
 
-    # Main plan quota (weekly cycle per observed resetTime ~7d): top-level usage.
-    usage = data.get("usage", {}) or {}
-    if usage:
-        reset_time = _parse_kimi_time(usage.get("resetTime"))
-        periods["weekly"] = _build_kimi_period(
-            "本周", "weekly", usage.get("used", "0"), usage.get("limit", "0"),
-            reset_time, 7 * 24 * 3600)
+        # Cap 5h remaining by the weekly plan's remaining quota. usage/limits
+        # share the same quota unit, so compare counts directly. When the weekly
+        # plan is nearly exhausted the 5h window may still report a full bucket,
+        # which is misleading -- effective 5h remaining can't exceed weekly left.
+        weekly = periods.get("weekly")
+        if weekly:
+            w_limit = weekly.get("limit", 0)
+            w_used = weekly.get("used", 0)
+            weekly_remaining_count = (w_limit - w_used) if w_limit else None
+            if weekly_remaining_count is not None and weekly_remaining_count < remaining_int:
+                log.info("kimi 5h remaining capped %d -> %d by weekly remaining",
+                         remaining_int, weekly_remaining_count)
+                remaining_int = weekly_remaining_count
+
+        effective_used = max(limit_int - remaining_int, 0)
+        periods["session"] = _build_kimi_period(
+            "近5小时", "session", str(effective_used), limit, reset_time, 5 * 3600)
+        break
 
     extra = {
         "membership": (data.get("user", {}) or {}).get("membership", {}).get("level", ""),
