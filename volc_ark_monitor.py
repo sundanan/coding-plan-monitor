@@ -51,6 +51,16 @@ KIMI_OAUTH_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
 KIMI_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
 KIMI_TOKEN_SKEW_S = 60  # refresh if access_token expires within this many seconds
 
+# membershipLevel enum -> plan display name (Kimi's plans are named after musical
+# tempo terms; the /usages endpoint returns only the enum, so we map it locally).
+KIMI_PLAN_NAMES = {
+    "LEVEL_FREE": "Adagio",
+    "LEVEL_TRIAL": "Andante",
+    "LEVEL_BASIC": "Moderato",
+    "LEVEL_INTERMEDIATE": "Allegretto",
+    "LEVEL_ADVANCED": "Allegro",
+}
+
 logging.basicConfig(
     filename=os.path.join(BASE_DIR, "monitor.log"),
     level=logging.DEBUG,
@@ -461,8 +471,9 @@ def _fetch_kimi_usage():
             "近5小时", "session", str(effective_used), limit, reset_time, 5 * 3600)
         break
 
+    raw_level = (data.get("user", {}) or {}).get("membership", {}).get("level", "")
     extra = {
-        "membership": (data.get("user", {}) or {}).get("membership", {}).get("level", ""),
+        "membership": KIMI_PLAN_NAMES.get(raw_level, raw_level),
         "parallel": (data.get("parallel", {}) or {}).get("limit", ""),
     }
 
