@@ -94,6 +94,7 @@ def load_config():
     default = {
         "ak": "", "sk": "", "region": "cn-beijing",
         "kimi_credential_path": "",  # empty -> default ~/.kimi-code/...
+        "volc_plan_name": "",  # Coding Plan tier badge, e.g. "Coding Plan Pro"
     }
     if os.path.exists(CONFIG_PATH):
         try:
@@ -805,7 +806,7 @@ class ConfigDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("用量监控配置")
-        self.setFixedSize(320, 360)
+        self.setFixedSize(320, 400)
         self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
         self.setStyleSheet(f"""
             QDialog {{ background: {C_BG}; color: {C_TEXT}; }}
@@ -834,6 +835,10 @@ class ConfigDialog(QDialog):
         self.region_input = QLineEdit(cfg.get("region", "cn-beijing"))
         self.region_input.setPlaceholderText("cn-beijing")
         layout.addRow("Region:", self.region_input)
+
+        self.volc_plan_input = QLineEdit(cfg.get("volc_plan_name", ""))
+        self.volc_plan_input.setPlaceholderText("如 Coding Plan Pro")
+        layout.addRow("火山套餐:", self.volc_plan_input)
 
         # --- Kimi section ---
         kimi_sep = QFrame()
@@ -884,6 +889,7 @@ class ConfigDialog(QDialog):
             "sk": self.sk_input.text().strip(),
             "region": self.region_input.text().strip() or "cn-beijing",
             "kimi_credential_path": self.kimi_path_input.text().strip(),
+            "volc_plan_name": self.volc_plan_input.text().strip(),
         }
         with open(CONFIG_PATH, 'w') as f:
             json.dump(cfg, f, indent=2)
@@ -1085,7 +1091,9 @@ class UsagePanel(QWidget):
         # data is {"volc": <volc data>, "kimi": <kimi data or None>}.
         # Volcengine Ark section (5h / weekly / monthly).
         volc = data.get("volc") or {}
-        layout.addLayout(self._section_header("🔥", "火山方舟"))
+        volc_plan_name = load_config().get("volc_plan_name", "")
+        layout.addLayout(self._section_header("🔥", "火山方舟",
+                                              badge=volc_plan_name or None))
         layout.addLayout(self._period_cards(volc, ["session", "weekly", "monthly"]))
 
         # Divider between providers.
