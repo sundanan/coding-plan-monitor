@@ -1054,7 +1054,7 @@ class UsagePanel(QWidget):
         icon_lbl.setPixmap(QIcon(make_icon_pixmap(16)).pixmap(16, 16))
         title_bar.addWidget(icon_lbl)
 
-        title = QLabel("Coding Plan用量监控")
+        title = QLabel("套餐用量")
         title.setFont(QFont("", 10, QFont.Bold))
         title.setStyleSheet(f"color: {C_TEXT}; border: none;")
         title_bar.addWidget(title)
@@ -1308,7 +1308,7 @@ class ArkMonitorTray(QSystemTrayIcon):
         self._is_alert = False
 
         self._update_icon()
-        self.setToolTip("Coding Plan用量监控")
+        self.setToolTip("套餐用量")
         self._setup_menu()
         self._refresh()
 
@@ -1357,7 +1357,7 @@ class ArkMonitorTray(QSystemTrayIcon):
             self.data = fetch_all_usage()
         except Exception as e:
             log.error("fetch_all_usage failed: %s", e)
-            self.setToolTip("Coding Plan监控 - 获取失败")
+            self.setToolTip("套餐用量监控 - 获取失败")
             return
 
         volc = self.data.get("volc") or {}
