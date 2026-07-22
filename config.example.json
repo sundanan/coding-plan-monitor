@@ -1,5 +1,7 @@
 {
   "ak": "YOUR_VOLC_ACCESS_KEY",
   "sk": "YOUR_VOLC_SECRET_KEY",
-  "region": "cn-beijing"
+  "region": "cn-beijing",
+  "kimi_credential_path": "",
+  "volc_plan_name": ""
 }

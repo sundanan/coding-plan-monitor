@@ -13,7 +13,11 @@ import sys
 import json
 import os
 import logging
-from datetime import datetime
+import time
+import urllib.request
+import urllib.parse
+import urllib.error
+from datetime import datetime, timezone
 
 from PyQt5.QtWidgets import (
     QApplication, QSystemTrayIcon, QMenu, QWidget, QVBoxLayout,
@@ -38,6 +42,24 @@ AUTO_HIDE_DELAY_MS = 1500
 EDGE_CHECK_MS = 300
 EDGE_ZONE_HEIGHT = 6
 EDGE_ZONE_WIDTH = 80
+
+# --- Kimi Code OAuth / Usage endpoints (reuses local kimi CLI credentials) ---
+
+KIMI_DEFAULT_CRED_PATH = os.path.expanduser("~/.kimi-code/credentials/kimi-code.json")
+KIMI_OAUTH_TOKEN_URL = "https://auth.kimi.com/api/oauth/token"
+KIMI_OAUTH_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
+KIMI_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
+KIMI_TOKEN_SKEW_S = 60  # refresh if access_token expires within this many seconds
+
+# membershipLevel enum -> plan display name (Kimi's plans are named after musical
+# tempo terms; the /usages endpoint returns only the enum, so we map it locally).
+KIMI_PLAN_NAMES = {
+    "LEVEL_FREE": "Adagio",
+    "LEVEL_TRIAL": "Andante",
+    "LEVEL_BASIC": "Moderato",
+    "LEVEL_INTERMEDIATE": "Allegretto",
+    "LEVEL_ADVANCED": "Allegro",
+}
 
 logging.basicConfig(
     filename=os.path.join(BASE_DIR, "monitor.log"),
@@ -69,7 +91,11 @@ C_GRAD_E      = "#7c3aed"
 # --- Data Layer ---
 
 def load_config():
-    default = {"ak": "", "sk": "", "region": "cn-beijing"}
+    default = {
+        "ak": "", "sk": "", "region": "cn-beijing",
+        "kimi_credential_path": "",  # empty -> default ~/.kimi-code/...
+        "volc_plan_name": "",  # Coding Plan tier badge, e.g. "Coding Plan Pro"
+    }
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH) as f:
@@ -156,6 +182,334 @@ def _mock_data():
                     "remaining_seconds": 20 * 24 * 3600, "total_seconds": 31 * 24 * 3600},
     }
     return {"status": "Mock", "update_time": now, "periods": periods, "source": "mock"}
+
+
+# --- Kimi Code Data Layer ---
+#
+# Reuses the local kimi CLI OAuth credentials (~/.kimi-code/credentials/kimi-code.json).
+# The CLI performs device-code login; we only refresh+read its stored token, so the
+# monitor never needs its own OAuth flow. Token file is shared with the CLI: each
+# refresh rotates the refresh_token, so we write new tokens back atomically and use
+# a non-blocking flock to avoid stomping a concurrent CLI refresh.
+
+def _kimi_cred_path():
+    cfg = load_config()
+    return cfg.get("kimi_credential_path") or KIMI_DEFAULT_CRED_PATH
+
+
+def _kimi_load_cred():
+    """Read kimi CLI credential file. Returns dict or None on any failure."""
+    path = _kimi_cred_path()
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _kimi_atomic_write_cred(cred):
+    """Write credential dict back atomically, preserving 0600 perms."""
+    path = _kimi_cred_path()
+    tmp = path + ".tmp"
+    try:
+        d = os.path.dirname(path)
+        if d and not os.path.isdir(d):
+            os.makedirs(d, mode=0o700, exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump(cred, f, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception as e:
+        log.warning("kimi cred write-back failed: %s", e)
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
+def _kimi_refresh_token(refresh_token):
+    """Exchange refresh_token for a new access/refresh token pair via OAuth.
+
+    Returns dict: {access_token, refresh_token, expires_at(unix), expires_in}.
+    Raises RuntimeError on non-200 or parse failure.
+    """
+    body = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": KIMI_OAUTH_CLIENT_ID,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        KIMI_OAUTH_TOKEN_URL, data=body, method="POST",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")[:200]
+        except Exception:
+            pass
+        raise RuntimeError(f"OAuth refresh HTTP {e.code}: {detail}")
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        raise RuntimeError(f"OAuth refresh parse error: {e}")
+    access = data.get("access_token")
+    new_refresh = data.get("refresh_token", refresh_token)
+    expires_in = int(data.get("expires_in", 900))
+    if not access:
+        raise RuntimeError(f"OAuth refresh missing access_token: {raw[:200]}")
+    return {
+        "access_token": access,
+        "refresh_token": new_refresh,
+        "expires_in": expires_in,
+        "expires_at": int(time.time()) + expires_in,
+        "token_type": data.get("token_type", "Bearer"),
+        "scope": data.get("scope", "kimi-code"),
+    }
+
+
+def _kimi_ensure_token(force_refresh=False):
+    """Return a usable access_token, refreshing and writing back if needed.
+
+    On refresh failure raises; caller catches and degrades.
+    """
+    cred = _kimi_load_cred()
+    if not cred or not cred.get("refresh_token"):
+        raise RuntimeError("no kimi credential file or refresh_token; run `kimi` to login")
+
+    now = int(time.time())
+    access = cred.get("access_token", "")
+    expires_at = cred.get("expires_at", 0)
+
+    if access and not force_refresh and expires_at - now > KIMI_TOKEN_SKEW_S:
+        return access
+
+    # Try to acquire a non-blocking lock so we don't fight the kimi CLI over the
+    # same refresh_token. If locked, fall back to whatever token is on disk.
+    lock_path = _kimi_cred_path() + ".lock"
+    lock_acquired = False
+    lock_fh = None
+    try:
+        import fcntl
+        lock_fh = open(lock_path, "w")
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_acquired = True
+        except (BlockingIOError, OSError):
+            lock_acquired = False
+    except Exception:
+        lock_acquired = False
+
+    try:
+        if not lock_acquired:
+            # Another process (likely kimi CLI) is refreshing; reuse on-disk token.
+            log.info("kimi cred lock busy; reusing on-disk token")
+            if access:
+                return access
+            raise RuntimeError("kimi cred locked and no usable access_token")
+
+        refreshed = _kimi_refresh_token(cred["refresh_token"])
+        # Merge onto existing cred to preserve any extra fields the CLI stores.
+        cred.update(refreshed)
+        _kimi_atomic_write_cred(cred)
+        log.info("kimi token refreshed, expires_at=%s", refreshed["expires_at"])
+        return refreshed["access_token"]
+    finally:
+        if lock_fh is not None:
+            try:
+                if lock_acquired:
+                    import fcntl
+                    fcntl.flock(lock_fh, fcntl.LOCK_UN)
+                lock_fh.close()
+            except Exception:
+                pass
+
+
+def _parse_kimi_time(s):
+    """Parse Kimi ISO8601 timestamps like '2026-07-21T08:18:53.857509Z'.
+
+    Returns a tz-aware UTC datetime, or None on failure.
+    """
+    if not s:
+        return None
+    try:
+        t = s.strip()
+        # fromisoformat gained 'Z' support in 3.11; normalise for older Pythons.
+        if t.endswith("Z"):
+            t = t[:-1] + "+00:00"
+        # Truncate sub-microsecond digits (nanoseconds) to 6 places.
+        if "." in t:
+            head, frac = t.split(".", 1)
+            # keep only the fractional part up to the timezone offset marker
+            for sep in ("+", "-"):
+                if sep in frac:
+                    frac, tz = frac.split(sep, 1)
+                    frac = (frac + "000000")[:6]
+                    t = head + "." + frac + sep + tz
+                    break
+            else:
+                frac = (frac + "000000")[:6]
+                t = head + "." + frac
+        dt = datetime.fromisoformat(t)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception as e:
+        log.warning("kimi time parse failed for %r: %s", s, e)
+        return None
+
+
+def _kimi_call_usages(access_token):
+    """GET /coding/v1/usages. Returns parsed JSON dict. Raises on non-2xx."""
+    req = urllib.request.Request(
+        KIMI_USAGE_URL, method="GET",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "replace")[:200]
+        except Exception:
+            pass
+        err = RuntimeError(f"usages HTTP {e.code}: {body}")
+        err.kimi_http_code = e.code
+        raise err
+
+
+def _build_kimi_period(name, level, used, limit, reset_time, total_seconds):
+    """Convert a Kimi usage window into the unified period dict shape."""
+    used = int(used) if used not in (None, "") else 0
+    limit = int(limit) if limit not in (None, "") else 0
+    usage_pct = (used / limit * 100) if limit > 0 else 100.0
+    remaining_pct = max(100.0 - usage_pct, 0.0)
+    now = datetime.now(timezone.utc)
+    rem_sec = (reset_time - now).total_seconds() if reset_time else 0
+    return {
+        "name": name, "level": level,
+        "usage_pct": usage_pct, "remaining_pct": remaining_pct,
+        "reset_time": reset_time,
+        "remaining_seconds": max(rem_sec, 0),
+        "total_seconds": total_seconds,
+        "limit": limit, "used": used,
+    }
+
+
+def _fetch_kimi_usage():
+    """Fetch Kimi Code plan usage via the CLI's OAuth token.
+
+    Returns dict shaped like the volc data (status/update_time/periods/source)
+    plus an 'extra' dict with membership + parallel info for UI badges.
+    Raises on auth/transport failure; caller degrades to None.
+    """
+    access_token = _kimi_ensure_token()
+    try:
+        data = _kimi_call_usages(access_token)
+    except RuntimeError as e:
+        # 401 -> token went stale between ensure and call; force one refresh+retry.
+        if getattr(e, "kimi_http_code", None) == 401:
+            log.info("kimi usages 401, forcing refresh and retry")
+            access_token = _kimi_ensure_token(force_refresh=True)
+            data = _kimi_call_usages(access_token)
+        else:
+            raise
+
+    now = datetime.now()
+    periods = {}
+
+    # Main plan quota (weekly cycle per observed resetTime ~7d): top-level usage.
+    # Built first so its remaining can cap the 5h window (a 5h window can never
+    # have more quota left than the weekly plan it draws from).
+    usage = data.get("usage", {}) or {}
+    if usage:
+        reset_time = _parse_kimi_time(usage.get("resetTime"))
+        periods["weekly"] = _build_kimi_period(
+            "本周", "weekly", usage.get("used", "0"), usage.get("limit", "0"),
+            reset_time, 7 * 24 * 3600)
+
+    # 5h rolling window: limits[].window with duration in minutes.
+    for item in data.get("limits", []) or []:
+        window = item.get("window", {}) or {}
+        duration_min = int(window.get("duration", 0) or 0)
+        # Match the 5h (300min) window; skip anything else.
+        if duration_min != 300:
+            continue
+        detail = item.get("detail", {}) or {}
+        limit = detail.get("limit", "0")
+        remaining = detail.get("remaining", "0")
+        limit_int = int(limit) if limit not in (None, "") else 0
+        remaining_int = int(remaining) if remaining not in (None, "") else 0
+        reset_time = _parse_kimi_time(detail.get("resetTime"))
+
+        # Cap 5h remaining by the weekly plan's remaining quota. usage/limits
+        # share the same quota unit, so compare counts directly. When the weekly
+        # plan is nearly exhausted the 5h window may still report a full bucket,
+        # which is misleading -- effective 5h remaining can't exceed weekly left.
+        weekly = periods.get("weekly")
+        if weekly:
+            w_limit = weekly.get("limit", 0)
+            w_used = weekly.get("used", 0)
+            weekly_remaining_count = (w_limit - w_used) if w_limit else None
+            if weekly_remaining_count is not None and weekly_remaining_count < remaining_int:
+                log.info("kimi 5h remaining capped %d -> %d by weekly remaining",
+                         remaining_int, weekly_remaining_count)
+                remaining_int = weekly_remaining_count
+
+        effective_used = max(limit_int - remaining_int, 0)
+        periods["session"] = _build_kimi_period(
+            "近5小时", "session", str(effective_used), limit, reset_time, 5 * 3600)
+        break
+
+    raw_level = (data.get("user", {}) or {}).get("membership", {}).get("level", "")
+    extra = {
+        "membership": KIMI_PLAN_NAMES.get(raw_level, raw_level),
+        "parallel": (data.get("parallel", {}) or {}).get("limit", ""),
+    }
+
+    log.info("kimi usage: periods=%s, extra=%s",
+             {k: f"{v['usage_pct']:.1f}%" for k, v in periods.items()}, extra)
+
+    return {
+        "status": "Kimi Code",
+        "update_time": now,
+        "periods": periods,
+        "source": "kimi",
+        "extra": extra,
+    }
+
+
+def fetch_all_usage():
+    """Fetch both Volcengine Ark and Kimi Code usage.
+
+    Volc failures fall back to mock (existing behaviour); Kimi failures degrade
+    to None so the panel can show an 'unauthorized' placeholder without breaking
+    the Volc section.
+    """
+    try:
+        volc = fetch_usage_data()
+    except Exception as e:
+        log.error("volc fetch_usage_data failed: %s", e)
+        volc = _mock_data()
+
+    kimi = None
+    try:
+        kimi = _fetch_kimi_usage()
+    except Exception as e:
+        log.error("kimi fetch failed: %s", e)
+
+    return {"volc": volc, "kimi": kimi}
 
 
 def calc_alert(usage_pct, remaining_seconds, total_seconds):
@@ -451,8 +805,8 @@ class PeriodCard(QFrame):
 class ConfigDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("火山引擎 API 配置")
-        self.setFixedSize(300, 200)
+        self.setWindowTitle("用量监控配置")
+        self.setFixedSize(320, 400)
         self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
         self.setStyleSheet(f"""
             QDialog {{ background: {C_BG}; color: {C_TEXT}; }}
@@ -464,7 +818,7 @@ class ConfigDialog(QDialog):
         """)
 
         layout = QFormLayout(self)
-        layout.setSpacing(14)
+        layout.setSpacing(12)
         layout.setContentsMargins(20, 20, 20, 16)
 
         cfg = load_config()
@@ -481,6 +835,25 @@ class ConfigDialog(QDialog):
         self.region_input = QLineEdit(cfg.get("region", "cn-beijing"))
         self.region_input.setPlaceholderText("cn-beijing")
         layout.addRow("Region:", self.region_input)
+
+        self.volc_plan_input = QLineEdit(cfg.get("volc_plan_name", ""))
+        self.volc_plan_input.setPlaceholderText("如 Coding Plan Pro")
+        layout.addRow("火山套餐:", self.volc_plan_input)
+
+        # --- Kimi section ---
+        kimi_sep = QFrame()
+        kimi_sep.setFixedHeight(1)
+        kimi_sep.setStyleSheet(f"background: {C_BORDER_LITE}; border: none;")
+        layout.addRow(kimi_sep)
+
+        kimi_hint = QLabel("Kimi 复用本地 kimi CLI 的 OAuth 凭证，无需 API Key。\n首次使用请在终端运行: kimi login")
+        kimi_hint.setWordWrap(True)
+        kimi_hint.setStyleSheet(f"color: {C_TEXT_MUTED}; font-size: 10px; border: none;")
+        layout.addRow(kimi_hint)
+
+        self.kimi_path_input = QLineEdit(cfg.get("kimi_credential_path", ""))
+        self.kimi_path_input.setPlaceholderText(f"留空用默认 {KIMI_DEFAULT_CRED_PATH}")
+        layout.addRow("Kimi凭证:", self.kimi_path_input)
 
         btn_row = QHBoxLayout()
         save_btn = QPushButton("保存")
@@ -515,6 +888,8 @@ class ConfigDialog(QDialog):
             "ak": self.ak_input.text().strip(),
             "sk": self.sk_input.text().strip(),
             "region": self.region_input.text().strip() or "cn-beijing",
+            "kimi_credential_path": self.kimi_path_input.text().strip(),
+            "volc_plan_name": self.volc_plan_input.text().strip(),
         }
         with open(CONFIG_PATH, 'w') as f:
             json.dump(cfg, f, indent=2)
@@ -696,7 +1071,7 @@ class UsagePanel(QWidget):
         icon_lbl.setPixmap(QIcon(make_icon_pixmap(16)).pixmap(16, 16))
         title_bar.addWidget(icon_lbl)
 
-        title = QLabel("Coding Plan用量监控")
+        title = QLabel("套餐用量")
         title.setFont(QFont("", 10, QFont.Bold))
         title.setStyleSheet(f"color: {C_TEXT}; border: none;")
         title_bar.addWidget(title)
@@ -713,25 +1088,45 @@ class UsagePanel(QWidget):
 
         self._divider(layout)
 
-        # Period cards
-        self._cards_layout = QVBoxLayout()
-        self._cards_layout.setSpacing(4)
-        periods = data.get("periods", {})
-        for key in ["session", "weekly", "monthly"]:
-            if key in periods:
-                self._cards_layout.addWidget(PeriodCard(periods[key]))
-        layout.addLayout(self._cards_layout)
+        # data is {"volc": <volc data>, "kimi": <kimi data or None>}.
+        # Volcengine Ark section (5h / weekly / monthly).
+        volc = data.get("volc") or {}
+        volc_plan_name = load_config().get("volc_plan_name", "")
+        layout.addLayout(self._section_header("🔥", "火山方舟",
+                                              badge=volc_plan_name or None))
+        layout.addLayout(self._period_cards(volc, ["session", "weekly", "monthly"]))
+
+        # Divider between providers.
+        self._divider(layout)
+
+        # Kimi Code section (5h / weekly; no monthly field exposed by the API).
+        kimi = data.get("kimi")
+        kimi_extra = (kimi or {}).get("extra", {}) or {}
+        badge_parts = []
+        if kimi_extra.get("membership"):
+            badge_parts.append(kimi_extra["membership"])
+        if kimi_extra.get("parallel"):
+            badge_parts.append(f"并发{kimi_extra['parallel']}")
+        layout.addLayout(self._section_header("💜", "Kimi Code",
+                                              badge=" · ".join(badge_parts) or None))
+        if kimi:
+            layout.addLayout(self._period_cards(kimi, ["session", "weekly"]))
+        else:
+            hint = QLabel("未授权 · 终端运行 kimi login 或点「Kimi」配置")
+            hint.setStyleSheet(f"color: {C_TEXT_MUTED}; font-size: 9px; border: none; padding: 2px 0;")
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
 
         # Footer
         footer = QHBoxLayout()
         footer.setContentsMargins(0, 0, 10, 0)
         footer.setSpacing(6)
-        update_time = data.get("update_time", datetime.now())
+        update_time = volc.get("update_time", datetime.now())
         ts = QLabel(f"更新于 {update_time.strftime('%H:%M:%S')}")
         ts.setStyleSheet(f"color: {C_TEXT_MUTED}; font-size: 9px; border: none;")
         footer.addWidget(ts)
 
-        if data.get("source") == "mock":
+        if volc.get("source") == "mock":
             mock_lbl = QLabel("MOCK")
             mock_lbl.setAlignment(Qt.AlignCenter)
             mock_lbl.setFixedSize(32, 14)
@@ -740,6 +1135,16 @@ class UsagePanel(QWidget):
                 border-radius: 7px; font-size: 8px; border: none;
             """)
             footer.addWidget(mock_lbl)
+
+        if not kimi:
+            na_lbl = QLabel("KIMI未授权")
+            na_lbl.setAlignment(Qt.AlignCenter)
+            na_lbl.setFixedSize(54, 14)
+            na_lbl.setStyleSheet(f"""
+                background: {C_RED_DIM}; color: {C_ALERT_RED};
+                border-radius: 7px; font-size: 8px; border: none;
+            """)
+            footer.addWidget(na_lbl)
 
         footer.addStretch()
 
@@ -760,10 +1165,64 @@ class UsagePanel(QWidget):
         volc_btn.clicked.connect(self._open_config)
         footer.addWidget(volc_btn)
 
+        # Kimi config button (opens same config dialog; path field configures cred file)
+        kimi_btn = QPushButton("Kimi")
+        kimi_btn.setCursor(Qt.PointingHandCursor)
+        kimi_btn.setFixedSize(32, 18)
+        kimi_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {C_BG_LIGHT}; color: {C_NEON_GREEN};
+                border: 1px solid {C_BORDER}; border-radius: 9px;
+                font-size: 9px; border: none; padding: 0;
+            }}
+            QPushButton:hover {{
+                background: {C_CARD}; color: {C_NEON_BLUE};
+            }}
+        """)
+        kimi_btn.clicked.connect(self._open_config)
+        footer.addWidget(kimi_btn)
+
         layout.addLayout(footer)
 
         frame_lay.addWidget(body)
         outer.addWidget(self._frame)
+
+    def _section_header(self, icon_text, title, badge=None):
+        """A provider section header row: icon + title + optional badge."""
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 1, 0, 1)
+        row.setSpacing(5)
+
+        icon = QLabel(icon_text)
+        icon.setStyleSheet(f"color: {C_TEXT}; font-size: 11px; border: none;")
+        row.addWidget(icon)
+
+        name = QLabel(title)
+        name.setFont(QFont("", 10, QFont.Bold))
+        name.setStyleSheet(f"color: {C_TEXT}; border: none;")
+        row.addWidget(name)
+
+        if badge:
+            b = QLabel(badge)
+            b.setStyleSheet(f"""
+                color: {C_TEXT_DIM}; font-size: 8px; border: none;
+                background: {C_BG_LIGHT}; border-radius: 7px; padding: 1px 6px;
+            """)
+            row.addWidget(b)
+
+        row.addStretch()
+        return row
+
+    def _period_cards(self, section_data, keys):
+        """Build a vertical layout of PeriodCards for the given period keys."""
+        col = QVBoxLayout()
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(4)
+        periods = section_data.get("periods", {}) or {}
+        for key in keys:
+            if key in periods:
+                col.addWidget(PeriodCard(periods[key]))
+        return col
 
     def _divider(self, layout):
         line = QFrame()
@@ -868,7 +1327,7 @@ class ArkMonitorTray(QSystemTrayIcon):
         self._is_alert = False
 
         self._update_icon()
-        self.setToolTip("Coding Plan用量监控")
+        self.setToolTip("套餐用量")
         self._setup_menu()
         self._refresh()
 
@@ -914,27 +1373,46 @@ class ArkMonitorTray(QSystemTrayIcon):
 
     def _refresh(self):
         try:
-            self.data = fetch_usage_data()
+            self.data = fetch_all_usage()
         except Exception as e:
-            log.error("fetch_usage_data failed: %s", e)
-            self.setToolTip("Coding Plan监控 - 获取失败")
+            log.error("fetch_all_usage failed: %s", e)
+            self.setToolTip("套餐用量监控 - 获取失败")
             return
 
-        periods = self.data.get("periods", {})
+        volc = self.data.get("volc") or {}
+        kimi = self.data.get("kimi")
 
-        session = periods.get("session", {})
-        s_rem_pct = session.get("remaining_pct", 0)
-        s_rem_sec = session.get("remaining_seconds", 0)
-        s_time_str = fmt_remaining(s_rem_sec)
+        volc_sess = (volc.get("periods") or {}).get("session", {})
+        kimi_sess = (kimi.get("periods") or {}).get("session", {}) if kimi else {}
 
-        s_total = session.get("total_seconds", 1)
-        s_time_rem_pct = s_rem_sec / s_total * 100 if s_total > 0 else 0
-        self._is_alert = s_rem_pct < s_time_rem_pct
+        volc_alert = self._session_alert(volc_sess)
+        kimi_alert = self._session_alert(kimi_sess)
+        self._is_alert = volc_alert or kimi_alert
 
-        self.setToolTip(
-            f"5h额度余: {s_rem_pct:.1f}% | 时间余: {s_time_str}"
-        )
+        # Tooltip: both providers' 5h snapshot.
+        parts = []
+        v_pct = volc_sess.get("remaining_pct", 0)
+        v_str = fmt_remaining(volc_sess.get("remaining_seconds", 0))
+        parts.append(f"火5h余:{v_pct:.0f}%|{v_str}")
+        if kimi:
+            k_pct = kimi_sess.get("remaining_pct", 0)
+            k_str = fmt_remaining(kimi_sess.get("remaining_seconds", 0))
+            parts.append(f"K5h余:{k_pct:.0f}%|{k_str}")
+        else:
+            parts.append("Kimi:未授权")
+        self.setToolTip("  ".join(parts))
         self._update_icon()
+
+    @staticmethod
+    def _session_alert(period):
+        """True when quota remaining% < time remaining% for a 5h window."""
+        if not period:
+            return False
+        rem_pct = period.get("remaining_pct", 0)
+        total = period.get("total_seconds", 0)
+        rem_sec = period.get("remaining_seconds", 0)
+        time_rem_pct = rem_sec / total * 100 if total > 0 else 0
+        return rem_pct < time_rem_pct
 
     def _show_panel(self):
         if self.data is None:
