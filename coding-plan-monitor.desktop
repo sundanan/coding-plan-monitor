@@ -2,9 +2,9 @@
 Type=Application
 Name=套餐用量
 Comment=Monitor Volcengine Ark and Kimi Code plan usage
-Exec=/usr/bin/python3 /home/sun/volc-ark-monitor/volc_ark_monitor.py
-Path=/home/sun/volc-ark-monitor
-Icon=/home/sun/volc-ark-monitor/icon.png
+Exec=/usr/bin/python3 /home/sun/coding-plan-monitor/volc_ark_monitor.py
+Path=/home/sun/coding-plan-monitor
+Icon=/home/sun/coding-plan-monitor/icon.png
 Terminal=false
 Categories=Utility;
 StartupNotify=false
