@@ -722,10 +722,10 @@ class BarRow(QWidget):
         bar.setFixedHeight(16)
         bar.setStyleSheet(f"""
             QProgressBar {{
-                background: {C_BG_LIGHT}; border: none; border-radius: 5px;
+                background: {C_BG_LIGHT}; border: none; border-radius: 7px;
             }}
             QProgressBar::chunk {{
-                background: {color}; border-radius: 5px;
+                background: {color}; border-radius: 7px;
             }}
         """)
 
