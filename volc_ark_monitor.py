@@ -25,7 +25,7 @@ from PyQt5.QtWidgets import (
     QDialog, QLineEdit, QFormLayout
 )
 from PyQt5.QtCore import (
-    Qt, QTimer, QSize, QRect, pyqtSignal, pyqtProperty, QPropertyAnimation, QEasingCurve
+    Qt, QTimer, QSize, QRect, QRectF, pyqtSignal, pyqtProperty, QPropertyAnimation, QEasingCurve
 )
 from PyQt5.QtNetwork import QLocalSocket, QLocalServer
 from PyQt5.QtGui import (
@@ -703,6 +703,49 @@ class PinButton(QPushButton):
         return QSize(22, 22)
 
 
+class ProgressChunk(QWidget):
+    """Custom-painted progress bar with reliable rounded corners.
+
+    QProgressBar::chunk border-radius renders inconsistently on narrow chunks
+    (a chunk at ~11% fill is only ~17px wide, so a 7px corner eats most of it
+    and looks rectangular). Painting directly lets the chunk keep a proper
+    rounded-cap shape at any fill level.
+    """
+    def __init__(self, value_pct, color, parent=None):
+        super().__init__(parent)
+        self._value = max(0.0, min(float(value_pct), 100.0))
+        self._color = QColor(color)
+        self.setFixedHeight(16)
+
+    def setValue(self, value_pct):
+        self._value = max(0.0, min(float(value_pct), 100.0))
+        self.update()
+
+    def sizeHint(self):
+        return QSize(120, 16)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = self.rect()
+        radius = r.height() / 2.0  # pill shape: corner = half height
+
+        # Track (background).
+        p.setBrush(QColor(C_BG_LIGHT))
+        p.setPen(Qt.NoPen)
+        p.drawRoundedRect(r, radius, radius)
+
+        # Filled chunk, clamped so it never exceeds the track width.
+        fill_w = r.width() * (self._value / 100.0)
+        if fill_w < 1:
+            return
+        # When the fill is narrower than the diameter, still draw a rounded cap
+        # so it looks like a pill, not a rectangle.
+        chunk_r = QRectF(r.left(), r.top(), max(fill_w, radius * 2), r.height())
+        p.setBrush(self._color)
+        p.drawRoundedRect(chunk_r, radius, radius)
+
+
 class BarRow(QWidget):
     """A labeled progress bar with percentage text right-aligned."""
     def __init__(self, label, value_pct, color, parent=None):
@@ -715,19 +758,7 @@ class BarRow(QWidget):
         lbl.setFixedWidth(30)
         lbl.setStyleSheet(f"color: {C_TEXT_DIM}; font-size: 10px; border: none;")
 
-        bar = QProgressBar()
-        bar.setRange(0, 100)
-        bar.setValue(int(min(value_pct, 100)))
-        bar.setTextVisible(False)
-        bar.setFixedHeight(16)
-        bar.setStyleSheet(f"""
-            QProgressBar {{
-                background: {C_BG_LIGHT}; border: none; border-radius: 7px;
-            }}
-            QProgressBar::chunk {{
-                background: {color}; border-radius: 7px;
-            }}
-        """)
+        bar = ProgressChunk(value_pct, color)
 
         pct = QLabel(f"{value_pct:.1f}%")
         pct.setFixedWidth(38)
