@@ -533,8 +533,25 @@ def fmt_remaining(seconds):
 
 # --- Icon Generator ---
 
-def make_icon_pixmap(size=64, alert=False):
-    """Volcano Ark themed icon: fiery gradient with ark silhouette + data bars."""
+# Background gradient stops per icon level:
+#   red    - no plan quota left on either provider
+#   orange - only one provider has weekly plan quota left
+#   yellow - both have plan quota but only one has 5h window left
+#   blue   - everything has remaining quota
+ICON_GRADIENTS = {
+    "red":    [("#cc1133"), ("#ff3355"), ("#ff6688")],
+    "orange": [("#ff6b35"), ("#f7931e"), ("#ffc107")],
+    "yellow": [("#f5d000"), ("#ffd84d"), ("#fff099")],
+    "blue":   [("#0080ff"), ("#00b4ff"), ("#4dd2ff")],
+}
+
+
+def make_icon_pixmap(size=64, level="blue"):
+    """Coding-plan monitor icon: rounded tile with data bars + ark silhouette.
+
+    level selects the gradient: red (all exhausted) / orange (one plan left) /
+    yellow (one 5h left) / blue (all healthy).
+    """
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.transparent)
     p = QPainter(pixmap)
@@ -544,16 +561,11 @@ def make_icon_pixmap(size=64, alert=False):
     pad = s * 0.10
     r = s * 0.24
 
-    if alert:
-        bg_grad = QLinearGradient(0, 0, s, s)
-        bg_grad.setColorAt(0, QColor("#cc1133"))
-        bg_grad.setColorAt(0.5, QColor("#ff3355"))
-        bg_grad.setColorAt(1, QColor("#ff6688"))
-    else:
-        bg_grad = QLinearGradient(0, 0, s, s)
-        bg_grad.setColorAt(0, QColor("#ff6b35"))
-        bg_grad.setColorAt(0.5, QColor("#f7931e"))
-        bg_grad.setColorAt(1, QColor("#ffc107"))
+    stops = ICON_GRADIENTS.get(level, ICON_GRADIENTS["blue"])
+    bg_grad = QLinearGradient(0, 0, s, s)
+    bg_grad.setColorAt(0, QColor(stops[0]))
+    bg_grad.setColorAt(0.5, QColor(stops[1]))
+    bg_grad.setColorAt(1, QColor(stops[2]))
     p.setBrush(QBrush(bg_grad))
     p.setPen(Qt.NoPen)
     p.drawRoundedRect(QRect(int(pad), int(pad), int(s - 2 * pad), int(s - 2 * pad)), int(r), int(r))
@@ -710,11 +722,10 @@ class BarRow(QWidget):
         bar.setFixedHeight(16)
         bar.setStyleSheet(f"""
             QProgressBar {{
-                background: {C_BG_LIGHT}; border: none; border-radius: 8px;
+                background: {C_BG_LIGHT}; border: none; border-radius: 5px;
             }}
             QProgressBar::chunk {{
-                background: {color}; border-radius: 8px;
-                margin-top: 1px; margin-bottom: 1px;
+                background: {color}; border-radius: 5px;
             }}
         """)
 
@@ -1325,7 +1336,7 @@ class ArkMonitorTray(QSystemTrayIcon):
         self.app = app
         self.data = None
         self.panel = None
-        self._is_alert = False
+        self._icon_level = "blue"
 
         self._update_icon()
         self.setToolTip("套餐用量")
@@ -1339,7 +1350,7 @@ class ArkMonitorTray(QSystemTrayIcon):
         self.timer.start(REFRESH_INTERVAL_MS)
 
     def _update_icon(self):
-        self.setIcon(QIcon(make_icon_pixmap(32, alert=self._is_alert)))
+        self.setIcon(QIcon(make_icon_pixmap(32, level=self._icon_level)))
 
     def _setup_menu(self):
         menu = QMenu()
@@ -1383,14 +1394,40 @@ class ArkMonitorTray(QSystemTrayIcon):
         volc = self.data.get("volc") or {}
         kimi = self.data.get("kimi")
 
-        volc_sess = (volc.get("periods") or {}).get("session", {})
-        kimi_sess = (kimi.get("periods") or {}).get("session", {}) if kimi else {}
+        volc_periods = volc.get("periods") or {}
+        kimi_periods = (kimi.get("periods") or {}) if kimi else {}
 
-        volc_alert = self._session_alert(volc_sess)
-        kimi_alert = self._session_alert(kimi_sess)
-        self._is_alert = volc_alert or kimi_alert
+        # A provider "has plan quota" if its weekly remaining > 0, and "has 5h"
+        # if its session remaining > 0. Unauthorised/missing providers count as
+        # having neither.
+        def has_quota(periods):
+            wk = periods.get("weekly", {})
+            return wk.get("remaining_pct", 0) > 0
+
+        def has_5h(periods):
+            sess = periods.get("session", {})
+            return sess.get("remaining_pct", 0) > 0
+
+        volc_plan = has_quota(volc_periods)
+        kimi_plan = has_quota(kimi_periods)
+        volc_5h = has_5h(volc_periods)
+        kimi_5h = has_5h(kimi_periods)
+
+        plans_left = int(volc_plan) + int(kimi_plan)
+        fiveh_left = int(volc_5h) + int(kimi_5h)
+
+        if plans_left == 0:
+            self._icon_level = "red"
+        elif plans_left == 1:
+            self._icon_level = "orange"
+        elif fiveh_left == 1:
+            self._icon_level = "yellow"
+        else:
+            self._icon_level = "blue"
 
         # Tooltip: both providers' 5h snapshot.
+        volc_sess = volc_periods.get("session", {})
+        kimi_sess = kimi_periods.get("session", {})
         parts = []
         v_pct = volc_sess.get("remaining_pct", 0)
         v_str = fmt_remaining(volc_sess.get("remaining_seconds", 0))
@@ -1403,17 +1440,6 @@ class ArkMonitorTray(QSystemTrayIcon):
             parts.append("Kimi:未授权")
         self.setToolTip("  ".join(parts))
         self._update_icon()
-
-    @staticmethod
-    def _session_alert(period):
-        """True when quota remaining% < time remaining% for a 5h window."""
-        if not period:
-            return False
-        rem_pct = period.get("remaining_pct", 0)
-        total = period.get("total_seconds", 0)
-        rem_sec = period.get("remaining_seconds", 0)
-        time_rem_pct = rem_sec / total * 100 if total > 0 else 0
-        return rem_pct < time_rem_pct
 
     def _show_panel(self):
         if self.data is None:
