@@ -713,7 +713,7 @@ class BarRow(QWidget):
                 background: {C_BG_LIGHT}; border: none; border-radius: 8px;
             }}
             QProgressBar::chunk {{
-                background: {color}; border-radius: 8px;
+                background: {color}; border-radius: 3px;
             }}
         """)
 
