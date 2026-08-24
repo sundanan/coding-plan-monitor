@@ -4,6 +4,7 @@ __pycache__/
 *.pyd
 config.json
 monitor.log
+monitor.log.*
 *.log
 .venv/
 venv/
