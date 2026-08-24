@@ -3,5 +3,7 @@
   "sk": "YOUR_VOLC_SECRET_KEY",
   "region": "cn-beijing",
   "kimi_credential_path": "",
-  "volc_plan_name": ""
+  "volc_plan_name": "",
+  "qianwen_cli_path": "",
+  "qwen_plan_name": ""
 }
