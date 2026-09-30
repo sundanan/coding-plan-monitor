@@ -1,17 +1,14 @@
 """Data layer for the 套餐用量 tray monitor.
 
-Provider usage fetchers (Volcengine Ark OpenAPI, Kimi Code usages API,
-Qwen Token Plan browser cache / qianwen CLI) plus shared config, alert and
-formatting helpers. Deliberately Qt-free so it stays testable headless.
+Provider usage fetchers (Volcengine Ark OpenAPI, Kimi Code usages API +
+web-gateway monthly cache) plus shared config, alert and formatting
+helpers. Deliberately Qt-free so it stays testable headless.
 """
 
 import json
 import os
-import glob
 import logging
 import logging.handlers
-import shutil
-import subprocess
 import time
 import urllib.request
 import urllib.parse
@@ -29,6 +26,7 @@ KIMI_DEFAULT_CRED_PATH = os.path.expanduser("~/.kimi-code/credentials/kimi-code.
 KIMI_OAUTH_TOKEN_URL = "https://auth.kimi.com/api/oauth/token"
 KIMI_OAUTH_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
 KIMI_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
+KIMI_ME_URL = "https://api.kimi.com/coding/v1/me"
 KIMI_TOKEN_SKEW_S = 60  # refresh if access_token expires within this many seconds
 
 # membershipLevel enum -> plan display name (Kimi's plans are named after musical
@@ -41,16 +39,13 @@ KIMI_PLAN_NAMES = {
     "LEVEL_ADVANCED": "Allegro",
 }
 
-# --- Qwen Token Plan usage sources ---
-# Primary: ~/.qwen_usage_cache.json — real-time 5h/7d ratios rewritten every
-# 5 minutes by qwen_usage_refresher.py (cron + headless browser capture;
-# Alibaba's WAF blocks all plain non-browser clients, so a real browser
-# engine is required).
-# Fallback: qianwen CLI's own OAuth session (no AK/SK needed).
-
-QIANWEN_CLI_TIMEOUT_S = 30
-QWEN_USAGE_CACHE_PATH = os.path.expanduser("~/.qwen_usage_cache.json")
-QWEN_CACHE_STALE_S = 30 * 60  # UI warns when the cache is older than this
+# Monthly (subscription-cycle) usage source: ~/.kimi_monthly_cache.json,
+# rewritten every 5 minutes by kimi_monthly_refresher.py (cron). The monthly
+# 总使用量 is only served by the www.kimi.com web gateway, which rejects the
+# CLI's OAuth token, so the refresher borrows the browser's web access token
+# from localStorage (read-only; never rotates the refresh token).
+KIMI_MONTHLY_CACHE_PATH = os.path.expanduser("~/.kimi_monthly_cache.json")
+KIMI_MONTHLY_STALE_S = 30 * 60
 
 # INFO keeps urllib3's DEBUG HTTP chatter out; rotation caps disk usage
 # (the old DEBUG setup grew the log past 12 MB in a few weeks).
@@ -73,10 +68,6 @@ def load_config():
         "ak": "", "sk": "", "region": "cn-beijing",
         "kimi_credential_path": "",  # empty -> default ~/.kimi-code/...
         "volc_plan_name": "",  # Coding Plan tier badge, e.g. "Coding Plan Pro"
-        "qianwen_cli_path": "",  # empty -> auto-detect `qianwen` binary
-        "qwen_plan_name": "",  # Token Plan badge, e.g. "Token Plan"
-        "qwen_usage_cache_path": "",  # empty -> ~/.qwen_usage_cache.json
-        "qwen_cache_stale_min": "",  # empty -> 30 (minutes)
     }
     if os.path.exists(CONFIG_PATH):
         try:
@@ -383,6 +374,25 @@ def _kimi_call_usages(access_token):
         raise err
 
 
+def _kimi_call_me(access_token):
+    """GET /coding/v1/me — account info, incl. user_level_name (plan tier).
+
+    The /usages payload carries no user/membership object, so the plan tier
+    shown in the section header (e.g. "Moderato") comes from here. Returns
+    None on any failure; caller degrades to an empty badge.
+    """
+    req = urllib.request.Request(KIMI_ME_URL, method="GET", headers={
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        log.warning("kimi me fetch failed: %s", e)
+        return None
+
+
 def _build_kimi_period(name, level, used, limit, reset_time, total_seconds):
     """Convert a Kimi usage window into the unified period dict shape."""
     used = int(used) if used not in (None, "") else 0
@@ -399,6 +409,67 @@ def _build_kimi_period(name, level, used, limit, reset_time, total_seconds):
         "total_seconds": total_seconds,
         "limit": limit, "used": used,
     }
+
+
+def _kimi_monthly_from_cache():
+    """Read the monthly subscription usage from the refresher's cache.
+
+    The web GetSubscriptionStats response carries subscriptionBalance
+    (amountUsedRatio = 本月总用量 incl. Kimi chat + Code, expireTime =
+    subscription renewal/reset) plus ratelimitCode5h/7d — the same numbers
+    the subscription page renders. Returns the unified "monthly" period dict
+    or None when the cache is missing/unusable. extra.stale marks a cache
+    older than KIMI_MONTHLY_STALE_S (browser hasn't refreshed its web token).
+    """
+    try:
+        with open(KIMI_MONTHLY_CACHE_PATH) as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        log.warning("kimi monthly cache read failed: %s", e)
+        return None
+
+    ratio = raw.get("monthlyUsedRatio")
+    if ratio is None:
+        return None
+    try:
+        usage_pct = float(ratio) * 100.0
+    except (TypeError, ValueError):
+        return None
+    usage_pct = max(0.0, min(usage_pct, 100.0))
+
+    reset_time = None
+    if raw.get("monthlyExpireTime"):
+        reset_time = _parse_kimi_time(raw["monthlyExpireTime"])
+    now = datetime.now(timezone.utc)
+    rem_sec = (reset_time - now).total_seconds() if reset_time else 0
+
+    age_s = None
+    extra = {"source": "web-cache"}
+    fetched_at = raw.get("fetchedAt")
+    if fetched_at:
+        try:
+            age_s = time.time() - float(fetched_at) / 1000
+            if age_s > KIMI_MONTHLY_STALE_S:
+                extra["stale"] = True
+        except Exception:
+            pass
+
+    if raw.get("monthlyCodeRatio") is not None:
+        extra["code_used_pct"] = round(float(raw["monthlyCodeRatio"]) * 100.0, 2)
+
+    period = {
+        "name": "本月", "level": "monthly",
+        "usage_pct": usage_pct, "remaining_pct": max(100.0 - usage_pct, 0.0),
+        "reset_time": reset_time,
+        "remaining_seconds": max(rem_sec, 0),
+        "total_seconds": 31 * 24 * 3600,
+        "extra": extra,
+    }
+    log.info("kimi monthly (cache): %.2f%%, age=%s",
+             usage_pct, f"{age_s:.0f}s" if age_s is not None else "unknown")
+    return period
 
 
 def _fetch_kimi_usage():
@@ -478,11 +549,19 @@ def _fetch_kimi_usage():
         periods["session"] = sess
         break
 
-    raw_level = (data.get("user", {}) or {}).get("membership", {}).get("level", "")
-    extra = {
-        "membership": KIMI_PLAN_NAMES.get(raw_level, raw_level),
-        "parallel": (data.get("parallel", {}) or {}).get("limit", ""),
-    }
+    # Monthly (subscription-cycle) usage from the web gateway cache — the
+    # CLI usages endpoint only exposes 5h/weekly windows.
+    monthly = _kimi_monthly_from_cache()
+    if monthly:
+        periods["monthly"] = monthly
+
+    me = _kimi_call_me(access_token)
+    membership = ""
+    if me:
+        membership = (me.get("user_level_name")
+                      or KIMI_PLAN_NAMES.get(me.get("user_level"), ""))
+    extra = {"membership": membership,
+             "parallel": (data.get("parallel", {}) or {}).get("limit", "")}
 
     log.info("kimi usage: periods=%s, extra=%s, capped=%s",
              {k: f"{v['usage_pct']:.1f}%" for k, v in periods.items()}, extra,
@@ -497,257 +576,12 @@ def _fetch_kimi_usage():
     }
 
 
-# --- Qwen Token Plan Data Layer ---
-#
-# Primary source: ~/.qwen_usage_cache.json, a file the user refreshes from the
-# browser (DevTools Network -> Copy response on the billing page). It carries
-# the real-time 5h/7d usage ratios that no non-browser client can fetch
-# directly (WAF blocks curl/Python at the TLS level).
-# Fallback: QianWen CLI (`qianwen usage summary --format json`). The CLI holds
-# its own OAuth device-flow credentials (first-time setup: `qianwen auth
-# login`), but v1.3.0 falsely reports not_subscribed on Gray accounts, so the
-# cache wins whenever it holds usable data.
-# All failures raise; the caller degrades to None and the panel shows a hint
-# without breaking the other sections.
-
-def _qianwen_cli_path():
-    """Locate the qianwen CLI binary.
-
-    Order: config `qianwen_cli_path` -> PATH -> well-known install locations
-    (the panel is usually launched from a .desktop file whose PATH lacks the
-    user's npm-global / nvm bin dirs).
-    """
-    cfg = load_config()
-    p = cfg.get("qianwen_cli_path", "")
-    if p and os.path.exists(p):
-        return p
-    w = shutil.which("qianwen")
-    if w:
-        return w
-    candidates = [os.path.expanduser("~/.npm-global/bin/qianwen")]
-    candidates += sorted(glob.glob(
-        os.path.expanduser("~/.nvm/versions/node/*/bin/qianwen")))
-    for cand in candidates:
-        if os.path.exists(cand):
-            return cand
-    return None
-
-
-def _build_qwen_period(name, level, used, limit, reset_time, total_seconds):
-    """Convert a Qwen usage window into the unified period dict shape."""
-    used = float(used) if used not in (None, "") else 0
-    limit = float(limit) if limit not in (None, "") else 0
-    usage_pct = (used / limit * 100) if limit > 0 else 0.0
-    remaining_pct = max(100.0 - usage_pct, 0.0)
-    now = datetime.now(timezone.utc)
-    if reset_time and reset_time.tzinfo is None:
-        reset_time = reset_time.replace(tzinfo=timezone.utc)
-    rem_sec = (reset_time - now).total_seconds() if reset_time else 0
-    return {
-        "name": name, "level": level,
-        "usage_pct": usage_pct, "remaining_pct": remaining_pct,
-        "reset_time": reset_time,
-        "remaining_seconds": max(rem_sec, 0),
-        "total_seconds": total_seconds,
-        "limit": limit, "used": used,
-    }
-
-
-def _qwen_cache_path():
-    """Cache file location, overridable via config `qwen_usage_cache_path`."""
-    p = load_config().get("qwen_usage_cache_path", "")
-    return os.path.expanduser(p) if p else QWEN_USAGE_CACHE_PATH
-
-
-def _qwen_stale_s():
-    """Staleness threshold in seconds, overridable via `qwen_cache_stale_min`."""
-    try:
-        mins = float(load_config().get("qwen_cache_stale_min") or 0)
-    except (TypeError, ValueError):
-        mins = 0
-    return mins * 60 if mins > 0 else QWEN_CACHE_STALE_S
-
-
-def _qwen_cache_status():
-    """Human-readable cache freshness line for the config dialog."""
-    try:
-        with open(_qwen_cache_path()) as f:
-            raw = json.load(f)
-        fetched = float(raw.get("fetchedAt") or 0)
-    except Exception:
-        return "缓存文件不存在 · 等待定时任务生成"
-    if not fetched:
-        return "缓存缺少 fetchedAt 字段"
-    age = max(time.time() - fetched / 1000, 0)
-    if age < 90:
-        return f"缓存更新于 {int(age)} 秒前"
-    if age < 5400:
-        return f"缓存更新于 {int(age / 60)} 分钟前"
-    return f"缓存更新于 {age / 3600:.1f} 小时前"
-
-
-def _fetch_qwen_usage_from_cache():
-    """Read real-time 5h/7d usage ratios from the browser-generated cache.
-
-    The cache is rewritten every 5 minutes by qwen_usage_refresher.py (cron),
-    which captures the usage API response with a headless browser — the only
-    way past Alibaba's WAF. Expected fields: per5HourPercentage /
-    per1WeekPercentage (0-1 fractions), per5HourResetTime / per1WeekResetTime
-    (epoch ms), fetchedAt (epoch ms). Any subset is fine — the page sometimes
-    returns only the weekly window. Returns the unified usage dict, or None
-    when the file is missing or has no usable fields (caller then falls back
-    to the CLI).
-    """
-    cache_path = _qwen_cache_path()
-    try:
-        with open(cache_path) as f:
-            raw = json.load(f)
-    except FileNotFoundError:
-        return None
-    except Exception as e:
-        log.warning("qwen cache read failed: %s", e)
-        return None
-
-    def _epoch_ms_dt(v):
-        try:
-            return datetime.fromtimestamp(float(v) / 1000, tz=timezone.utc)
-        except Exception:
-            return None
-
-    periods = {}
-    win_specs = [
-        ("per5HourPercentage", "per5HourResetTime", "session", "近5小时", 5 * 3600),
-        ("per1WeekPercentage", "per1WeekResetTime", "weekly", "本周", 7 * 24 * 3600),
-    ]
-    for pct_key, reset_key, level, name, total_s in win_specs:
-        pct = raw.get(pct_key)
-        if pct is None:
-            continue
-        periods[level] = _build_qwen_period(
-            name, level, float(pct) * 100, 100,
-            _epoch_ms_dt(raw.get(reset_key)), total_s)
-    if not periods:
-        return None
-
-    extra = {"source": "browser-cache"}
-    # Plan tier (e.g. "standard") captured from the subscription endpoint.
-    spec = raw.get("specCode")
-    if spec:
-        extra["plan"] = str(spec)
-    age_s = None
-    fetched_at = raw.get("fetchedAt")
-    if fetched_at:
-        try:
-            age_s = time.time() - float(fetched_at) / 1000
-            if age_s > _qwen_stale_s():
-                extra["stale"] = True
-        except Exception:
-            pass
-
-    log.info("qwen usage (cache): periods=%s, age=%s",
-             {k: f"{v['usage_pct']:.1f}%" for k, v in periods.items()},
-             f"{age_s:.0f}s" if age_s is not None else "unknown")
-
-    return {
-        "status": "Qwen Token Plan",
-        "update_time": datetime.now(),
-        "periods": periods,
-        "source": "browser-cache",
-        "extra": extra,
-    }
-
-
-def _fetch_qwen_usage():
-    """Fetch Qwen Token Plan usage: browser cache first, CLI as fallback.
-
-    The cache path is the only way to get real-time 5h/7d ratios (WAF blocks
-    non-browser clients); the CLI fallback parses the `token_plan` section of
-    `qianwen usage summary --format json`. When the account has no Token Plan
-    subscription the CLI result carries an empty `periods` map plus
-    extra.not_subscribed, and the panel shows a placeholder instead of period
-    cards.
-    """
-    cached = _fetch_qwen_usage_from_cache()
-    if cached:
-        return cached
-
-    cli = _qianwen_cli_path()
-    if not cli:
-        raise RuntimeError(
-            "qianwen CLI not found; install with "
-            "`npm install -g @qianwenai/qianwen-cli`")
-
-    try:
-        proc = subprocess.run(
-            [cli, "usage", "summary", "--format", "json"],
-            capture_output=True, text=True, timeout=QIANWEN_CLI_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("qianwen CLI timed out")
-    if proc.returncode == 2:
-        raise RuntimeError("qianwen CLI not authenticated; run `qianwen auth login`")
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"qianwen CLI exit {proc.returncode}: {proc.stderr.strip()[:200]}")
-
-    # The CLI may print non-JSON notices before the document; skip to '{'.
-    out = proc.stdout
-    start = out.find("{")
-    if start < 0:
-        raise RuntimeError(f"qianwen CLI returned no JSON: {out[:200]}")
-    data = json.loads(out[start:])
-
-    now = datetime.now()
-    periods = {}
-    extra = {}
-
-    tp = data.get("token_plan") or data.get("coding_plan") or {}
-    if not tp.get("subscribed"):
-        extra["not_subscribed"] = True
-    else:
-        if tp.get("plan"):
-            extra["plan"] = tp["plan"]
-        windows = tp.get("windows") or {}
-        win_specs = [
-            ("per_5h", "session", "近5小时", 5 * 3600),
-            ("weekly", "weekly", "本周", 7 * 24 * 3600),
-            ("monthly", "monthly", "本月", 31 * 24 * 3600),
-        ]
-        for wkey, level, name, total_s in win_specs:
-            w = windows.get(wkey)
-            if not w:
-                continue
-            used_pct = w.get("used_pct")
-            total = w.get("total")
-            remaining = w.get("remaining")
-            if used_pct is None and total:
-                used_pct = (total - (remaining or 0)) / total * 100
-            reset_time = _parse_kimi_time(
-                w.get("resetTime") or w.get("resetDate") or w.get("reset_time"))
-            period = _build_qwen_period(
-                name, level, str(used_pct or 0), "100", reset_time, total_s)
-            if total:
-                period["limit"] = total
-                period["used"] = total - (remaining or 0)
-            periods[level] = period
-
-    log.info("qwen usage: periods=%s, extra=%s",
-             {k: f"{v['usage_pct']:.1f}%" for k, v in periods.items()}, extra)
-
-    return {
-        "status": "Qwen Token Plan",
-        "update_time": now,
-        "periods": periods,
-        "source": "qianwen-cli",
-        "extra": extra,
-    }
-
-
 def fetch_all_usage():
-    """Fetch Volcengine Ark, Kimi Code, and Qwen Token Plan usage.
+    """Fetch Volcengine Ark and Kimi Code usage.
 
-    Volc failures fall back to mock (existing behaviour); Kimi/Qwen failures
-    degrade to None so the panel can show a placeholder without breaking
-    the other sections.
+    Volc failures fall back to mock (existing behaviour); Kimi failure
+    degrades to a monthly-only dict from the web cache (or None) so the
+    panel can show a placeholder without breaking the other section.
     """
     try:
         volc = fetch_usage_data()
@@ -760,14 +594,16 @@ def fetch_all_usage():
         kimi = _fetch_kimi_usage()
     except Exception as e:
         log.error("kimi fetch failed: %s", e)
+        # The CLI OAuth may be dead (e.g. refresh token revoked after days
+        # offline) while the web-cache monthly number is still good — keep
+        # the monthly card alive instead of blanking the whole section.
+        monthly = _kimi_monthly_from_cache()
+        if monthly:
+            kimi = {"status": "Kimi Code", "update_time": datetime.now(),
+                    "periods": {"monthly": monthly}, "source": "kimi",
+                    "extra": {}}
 
-    qwen = None
-    try:
-        qwen = _fetch_qwen_usage()
-    except Exception as e:
-        log.error("qwen fetch failed: %s", e)
-
-    return {"volc": volc, "kimi": kimi, "qwen": qwen}
+    return {"volc": volc, "kimi": kimi}
 
 
 def calc_alert(usage_pct, remaining_seconds, total_seconds):

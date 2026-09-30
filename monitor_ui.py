@@ -26,8 +26,8 @@ from PyQt5.QtGui import (
 )
 
 from monitor_data import (
-    log, CONFIG_PATH, KIMI_DEFAULT_CRED_PATH, QWEN_USAGE_CACHE_PATH,
-    QWEN_CACHE_STALE_S, load_config, _qwen_cache_status, fetch_all_usage,
+    log, CONFIG_PATH, KIMI_DEFAULT_CRED_PATH,
+    load_config, fetch_all_usage,
     calc_alert, fmt_remaining,
 )
 
@@ -62,11 +62,11 @@ C_GRAD_E      = "#7c3aed"
 
 # --- Icon Generator ---
 
-# Background gradient stops per icon level (based on available plan count):
-#   red    - 0 providers have plan quota left
-#   orange - 1 provider has plan quota left
-#   yellow - 2 providers have plan quota left
-#   blue   - all 3 providers have plan quota left
+# Background gradient stops per icon level (subscription health light):
+#   red    - both providers' binding entitlement exhausted
+#   orange - one provider exhausted (or unauthorized)
+#   yellow - none exhausted but at least one is low (≤ LOW_PCT left)
+#   blue   - both healthy
 ICON_GRADIENTS = {
     "red":    [("#cc1133"), ("#ff3355"), ("#ff6688")],
     "orange": [("#ff6b35"), ("#f7931e"), ("#ffc107")],
@@ -392,7 +392,7 @@ class ConfigDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("用量监控配置")
-        self.setFixedSize(320, 650)
+        self.setFixedSize(320, 470)
         self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
         self.setStyleSheet(f"""
             QDialog {{ background: {C_BG}; color: {C_TEXT}; }}
@@ -441,42 +441,6 @@ class ConfigDialog(QDialog):
         self.kimi_path_input.setPlaceholderText(f"留空用默认 {KIMI_DEFAULT_CRED_PATH}")
         layout.addRow("Kimi凭证:", self.kimi_path_input)
 
-        # --- Qwen Token Plan section (cron headless refresh + cache) ---
-        qwen_sep = QFrame()
-        qwen_sep.setFixedHeight(1)
-        qwen_sep.setStyleSheet(f"background: {C_BORDER_LITE}; border: none;")
-        layout.addRow(qwen_sep)
-
-        qwen_hint = QLabel(
-            "千问用量由后台无头浏览器每 5 分钟自动抓取并写入缓存文件（cron）。\n"
-            "若面板提示缓存过旧（会话过期），在终端运行:\n"
-            "python3 ~/coding-plan-monitor/qwen_cookie_import.py")
-        qwen_hint.setWordWrap(True)
-        qwen_hint.setStyleSheet(f"color: {C_TEXT_MUTED}; font-size: 10px; border: none;")
-        layout.addRow(qwen_hint)
-
-        cache_status = QLabel("状态: " + _qwen_cache_status())
-        cache_status.setWordWrap(True)
-        cache_status.setStyleSheet(f"color: {C_NEON_GREEN}; font-size: 10px; border: none;")
-        layout.addRow(cache_status)
-
-        self.qwen_cache_input = QLineEdit(cfg.get("qwen_usage_cache_path", ""))
-        self.qwen_cache_input.setPlaceholderText(f"留空用默认 {QWEN_USAGE_CACHE_PATH}")
-        layout.addRow("缓存文件:", self.qwen_cache_input)
-
-        stale_cfg = cfg.get("qwen_cache_stale_min", "")
-        self.qwen_stale_input = QLineEdit("" if stale_cfg in ("", None) else str(stale_cfg))
-        self.qwen_stale_input.setPlaceholderText(f"留空用默认 {QWEN_CACHE_STALE_S // 60} 分钟")
-        layout.addRow("过旧阈值:", self.qwen_stale_input)
-
-        self.qianwen_cli_input = QLineEdit(cfg.get("qianwen_cli_path", ""))
-        self.qianwen_cli_input.setPlaceholderText("留空自动探测（CLI 为降级数据源）")
-        layout.addRow("CLI路径:", self.qianwen_cli_input)
-
-        self.qwen_plan_input = QLineEdit(cfg.get("qwen_plan_name", ""))
-        self.qwen_plan_input.setPlaceholderText("如 Token Plan")
-        layout.addRow("千问套餐:", self.qwen_plan_input)
-
         btn_row = QHBoxLayout()
         save_btn = QPushButton("保存")
         save_btn.setCursor(Qt.PointingHandCursor)
@@ -506,11 +470,6 @@ class ConfigDialog(QDialog):
         layout.addRow(btn_row)
 
     def _save(self):
-        stale_min = self.qwen_stale_input.text().strip()
-        try:
-            stale_min = int(float(stale_min)) if stale_min else ""
-        except ValueError:
-            stale_min = ""  # invalid input falls back to default
         # Merge onto the existing file so fields this dialog doesn't know
         # about survive a save.
         cfg = {}
@@ -526,10 +485,6 @@ class ConfigDialog(QDialog):
             "region": self.region_input.text().strip() or "cn-beijing",
             "kimi_credential_path": self.kimi_path_input.text().strip(),
             "volc_plan_name": self.volc_plan_input.text().strip(),
-            "qianwen_cli_path": self.qianwen_cli_input.text().strip(),
-            "qwen_plan_name": self.qwen_plan_input.text().strip(),
-            "qwen_usage_cache_path": self.qwen_cache_input.text().strip(),
-            "qwen_cache_stale_min": stale_min,
         })
         with open(CONFIG_PATH, 'w') as f:
             json.dump(cfg, f, indent=2)
@@ -607,13 +562,14 @@ class UsagePanel(QWidget):
     configChanged = pyqtSignal()
     showRequested = pyqtSignal()
 
-    def __init__(self, data, parent=None):
+    def __init__(self, data, parent=None, icon_level="blue"):
         super().__init__(parent)
         self.setObjectName("UsagePanel")
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setFixedWidth(240)
         self._drag_pos = None
         self._data = data
+        self._icon_level = icon_level
         self._pinned = False
 
         # Auto-hide timer
@@ -698,13 +654,16 @@ class UsagePanel(QWidget):
         self._frame.setFixedSize(self.width(), frame_h)
         self.setFixedHeight(frame_h)
 
-    def update_data(self, data):
+    def update_data(self, data, icon_level=None):
         """Rebuild the panel body in place while the panel stays visible.
 
         Called when a background refresh lands new data on a shown (possibly
-        pinned) panel, so the numbers never go stale until re-opened.
+        pinned) panel, so the numbers never go stale until re-opened. The
+        icon level keeps the corner glyph in sync with the tray icon.
         """
         self._data = data
+        if icon_level:
+            self._icon_level = icon_level
         old = self._body
         self._build_body(data)
         old.setParent(None)
@@ -728,7 +687,7 @@ class UsagePanel(QWidget):
         title_bar.setSpacing(4)
 
         icon_lbl = QLabel()
-        icon_lbl.setPixmap(QIcon(make_icon_pixmap(16)).pixmap(16, 16))
+        icon_lbl.setPixmap(make_icon_pixmap(16, level=self._icon_level))
         title_bar.addWidget(icon_lbl)
 
         title = QLabel("套餐用量")
@@ -752,8 +711,8 @@ class UsagePanel(QWidget):
         # Volcengine Ark section (5h / weekly / monthly).
         volc = data.get("volc") or {}
         volc_plan_name = load_config().get("volc_plan_name", "")
-        layout.addLayout(self._section_header("🔥", "火山方舟",
-                                              badge=volc_plan_name or None))
+        layout.addLayout(self._section_header("火山方舟",
+                                              volc_plan_name or None))
         if volc.get("source") == "error":
             hint = QLabel(f"获取失败 · 点「火山」检查 AK/SK\n{str(volc.get('error', ''))[:80]}")
             hint.setStyleSheet(f"color: {C_ALERT_RED}; font-size: 9px; border: none; padding: 2px 0;")
@@ -769,57 +728,16 @@ class UsagePanel(QWidget):
         # Divider between providers.
         self._divider(layout)
 
-        # Kimi Code section (5h / weekly; no monthly field exposed by the API).
+        # Kimi Code section (5h / weekly from the CLI usages API, plus the
+        # monthly subscription balance from the web-gateway cache).
         kimi = data.get("kimi")
         kimi_extra = (kimi or {}).get("extra", {}) or {}
-        badge_parts = []
-        if kimi_extra.get("membership"):
-            badge_parts.append(kimi_extra["membership"])
-        if kimi_extra.get("parallel"):
-            badge_parts.append(f"并发{kimi_extra['parallel']}")
-        layout.addLayout(self._section_header("💜", "Kimi Code",
-                                              badge=" · ".join(badge_parts) or None))
+        layout.addLayout(self._section_header("月之暗面",
+                                              kimi_extra.get("membership") or None))
         if kimi:
-            layout.addLayout(self._period_cards(kimi, ["session", "weekly"]))
+            layout.addLayout(self._period_cards(kimi, ["session", "weekly", "monthly"]))
         else:
             hint = QLabel("未授权 · 终端运行 kimi login 或点「Kimi」配置")
-            hint.setStyleSheet(f"color: {C_TEXT_MUTED}; font-size: 9px; border: none; padding: 2px 0;")
-            hint.setWordWrap(True)
-            layout.addWidget(hint)
-
-        # Divider between providers.
-        self._divider(layout)
-
-        # Qwen Token Plan section (browser cache first, QianWen CLI fallback).
-        qwen = data.get("qwen")
-        qwen_extra = (qwen or {}).get("extra", {}) or {}
-        qwen_plan_name = load_config().get("qwen_plan_name", "")
-        qwen_badge_parts = []
-        if qwen_plan_name:
-            qwen_badge_parts.append(qwen_plan_name)
-        if qwen_extra.get("plan"):
-            qwen_badge_parts.append(qwen_extra["plan"])
-        layout.addLayout(self._section_header("🔮", "千问 Token Plan",
-                                              badge=" · ".join(qwen_badge_parts) or None))
-        if qwen:
-            qwen_periods = qwen.get("periods", {})
-            if qwen_periods:
-                layout.addLayout(self._period_cards(qwen, ["session", "weekly", "monthly"]))
-                # Cache older than the staleness threshold -> the cron-driven
-                # headless refresher is failing (usually an expired session).
-                if qwen_extra.get("stale"):
-                    stale_lbl = QLabel("⚠ 缓存较旧 · 自动刷新异常，查看 qwen_refresh.log")
-                    stale_lbl.setStyleSheet(
-                        f"color: {C_ORANGE}; font-size: 8px; border: none; padding: 1px 0;")
-                    stale_lbl.setWordWrap(True)
-                    layout.addWidget(stale_lbl)
-            elif qwen_extra.get("not_subscribed"):
-                hint2 = QLabel("当前账号未订阅 Token Plan")
-                hint2.setStyleSheet(f"color: {C_TEXT_MUTED}; font-size: 8px; border: none; padding: 1px 0;")
-                hint2.setWordWrap(True)
-                layout.addWidget(hint2)
-        else:
-            hint = QLabel("无数据 · 终端运行 qwen_cookie_import.py 导入会话")
             hint.setStyleSheet(f"color: {C_TEXT_MUTED}; font-size: 9px; border: none; padding: 2px 0;")
             hint.setWordWrap(True)
             layout.addWidget(hint)
@@ -852,16 +770,6 @@ class UsagePanel(QWidget):
                 border-radius: 7px; font-size: 8px; border: none;
             """)
             footer.addWidget(na_lbl)
-
-        if not qwen:
-            qw_lbl = QLabel("千问无数据")
-            qw_lbl.setAlignment(Qt.AlignCenter)
-            qw_lbl.setFixedSize(54, 14)
-            qw_lbl.setStyleSheet(f"""
-                background: {C_RED_DIM}; color: {C_ALERT_RED};
-                border-radius: 7px; font-size: 8px; border: none;
-            """)
-            footer.addWidget(qw_lbl)
 
         footer.addStretch()
 
@@ -899,50 +807,30 @@ class UsagePanel(QWidget):
         kimi_btn.clicked.connect(self._open_config)
         footer.addWidget(kimi_btn)
 
-        # Qwen config button (opens same config dialog; cache path/staleness/CLI fields)
-        qwen_btn = QPushButton("千问")
-        qwen_btn.setCursor(Qt.PointingHandCursor)
-        qwen_btn.setFixedSize(32, 18)
-        qwen_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {C_BG_LIGHT}; color: {C_GRAD_E};
-                border: 1px solid {C_BORDER}; border-radius: 9px;
-                font-size: 9px; border: none; padding: 0;
-            }}
-            QPushButton:hover {{
-                background: {C_CARD}; color: {C_NEON_BLUE};
-            }}
-        """)
-        qwen_btn.clicked.connect(self._open_config)
-        footer.addWidget(qwen_btn)
-
         layout.addLayout(footer)
 
         self._frame.layout().addWidget(body)
         self._body = body
 
-    def _section_header(self, icon_text, title, badge=None):
-        """A provider section header row: icon + title + optional badge."""
+    def _section_header(self, title, plan=None):
+        """Provider header row: bold product name + dim plan name, no icon.
+
+        Both provider headers share the exact same format —
+        火山方舟 Coding Plan Pro / 月之暗面 Moderato.
+        """
         row = QHBoxLayout()
         row.setContentsMargins(0, 1, 0, 1)
         row.setSpacing(5)
-
-        icon = QLabel(icon_text)
-        icon.setStyleSheet(f"color: {C_TEXT}; font-size: 11px; border: none;")
-        row.addWidget(icon)
 
         name = QLabel(title)
         name.setFont(QFont("", 10, QFont.Bold))
         name.setStyleSheet(f"color: {C_TEXT}; border: none;")
         row.addWidget(name)
 
-        if badge:
-            b = QLabel(badge)
-            b.setStyleSheet(f"""
-                color: {C_TEXT_DIM}; font-size: 8px; border: none;
-                background: {C_BG_LIGHT}; border-radius: 7px; padding: 1px 6px;
-            """)
-            row.addWidget(b)
+        if plan:
+            p = QLabel(plan)
+            p.setStyleSheet(f"color: {C_TEXT_DIM}; font-size: 9px; border: none;")
+            row.addWidget(p)
 
         row.addStretch()
         return row
@@ -1055,8 +943,7 @@ class UsagePanel(QWidget):
 class FetchWorker(QThread):
     """Fetches all providers off the UI thread.
 
-    A refresh can stall on the volc SDK, kimi OAuth round-trips, or (when
-    the cache is missing) the qianwen CLI's 30s subprocess timeout — none
+    A refresh can stall on the volc SDK or kimi OAuth round-trips — none
     of which may freeze the tray icon, tooltip, or panel animations.
     """
     done = pyqtSignal(dict)
@@ -1146,56 +1033,63 @@ class ArkMonitorTray(QSystemTrayIcon):
         # Push fresh numbers into a visible panel (pinned panels especially
         # used to go stale until re-opened).
         if self.panel is not None and self.panel.isVisible():
-            self.panel.update_data(data)
+            self.panel.update_data(data, self._icon_level)
 
     def _apply_status(self):
         volc = self.data.get("volc") or {}
         kimi = self.data.get("kimi")
-        qwen = self.data.get("qwen")
 
         volc_periods = volc.get("periods") or {}
         kimi_periods = (kimi.get("periods") or {}) if kimi else {}
-        qwen_periods = (qwen.get("periods") or {}) if qwen else {}
 
-        # A provider "has plan quota" if its weekly remaining is above a
-        # small threshold (0.01%). Floating-point residue from API rounding
-        # can leave values like 0.00015% which should count as exhausted.
+        # Icon colour follows each subscription's binding entitlement, not
+        # the short rate windows:
+        #   火山方舟 — the monthly plan is the entitlement and the weekly
+        #     window gates it, so the tighter remainder decides.
+        #   月之暗面 — the monthly subscription balance IS the entitlement
+        #     (5h/7d are rate windows that reset within hours/days); fall
+        #     back to weekly only while the web cache has no monthly card.
+        # States: "out" ≤ eps (API rounding residue like 0.00015% counts as
+        # gone), "low" ≤ LOW_PCT (close to exhausting at a realistic burn
+        # rate), else "ok". Missing data (unauthorized / no cache) counts
+        # as out — the provider is unusable either way.
         _QUOTA_EPS = 0.01
+        _LOW_PCT = 15.0
 
-        def has_quota(periods):
-            wk = periods.get("weekly", {})
-            return wk.get("remaining_pct", 0) > _QUOTA_EPS
-
-        def volc_has_quota(periods):
-            # Cards show raw per-window percentages (matching the web
-            # console), so an exhausted monthly window must be checked here
-            # explicitly: it blocks the 5h/weekly windows regardless of
-            # their own headroom.
+        def binding_remaining(periods, keys):
             rems = [p.get("remaining_pct", 0)
-                    for p in (periods.get("weekly"), periods.get("monthly")) if p]
-            return bool(rems) and min(rems) > _QUOTA_EPS
+                    for p in (periods.get(k) for k in keys) if p]
+            return min(rems) if rems else None
 
-        volc_plan = volc_has_quota(volc_periods)
-        kimi_plan = has_quota(kimi_periods)
-        qwen_plan = has_quota(qwen_periods) if qwen else False
+        def state(rem):
+            if rem is None:
+                return "none"
+            if rem <= _QUOTA_EPS:
+                return "out"
+            if rem <= _LOW_PCT:
+                return "low"
+            return "ok"
 
-        plans_left = int(volc_plan) + int(kimi_plan) + int(qwen_plan)
-        log.info("icon: volc_plan=%s kimi_plan=%s qwen_plan=%s plans_left=%d | volc_wk_rem=%s",
-                 volc_plan, kimi_plan, qwen_plan, plans_left,
-                 volc_periods.get("weekly", {}).get("remaining_pct"))
+        volc_state = state(binding_remaining(volc_periods, ("monthly", "weekly")))
+        kimi_state = state(binding_remaining(kimi_periods, ("monthly", "weekly")))
+        log.info("icon: volc=%s kimi=%s | volc_rem=%s kimi_rem=%s",
+                 volc_state, kimi_state,
+                 binding_remaining(volc_periods, ("monthly", "weekly")),
+                 binding_remaining(kimi_periods, ("monthly", "weekly")))
 
-        if plans_left == 0:
+        states = (volc_state, kimi_state)
+        outs = sum(1 for s in states if s in ("out", "none"))
+        if outs >= len(states):
             self._icon_level = "red"
-        elif plans_left == 1:
+        elif outs:
             self._icon_level = "orange"
-        elif plans_left == 2:
+        elif "low" in states:
             self._icon_level = "yellow"
         else:
             self._icon_level = "blue"
 
         # Tooltip: all providers' snapshot.
         volc_sess = volc_periods.get("session", {})
-        kimi_sess = kimi_periods.get("session", {})
         parts = []
         if volc.get("source") == "error":
             parts.append("火山:获取失败")
@@ -1206,25 +1100,24 @@ class ArkMonitorTray(QSystemTrayIcon):
         else:
             parts.append("火山:加载中")
         if kimi:
-            k_pct = kimi_sess.get("remaining_pct", 0)
-            k_str = fmt_remaining(kimi_sess.get("remaining_seconds", 0))
-            if kimi_sess.get("capped_by"):
-                k_raw = kimi_sess.get("raw_remaining_pct", 0)
-                parts.append(f"K5h余:{k_pct:.0f}%(窗口{k_raw:.0f}%)|{k_str}")
+            # The monthly balance is the binding entitlement — show it when
+            # the web cache provides one, else fall back to the 5h window.
+            k_month = kimi_periods.get("monthly")
+            if k_month:
+                k_pct = k_month.get("remaining_pct", 0)
+                k_str = fmt_remaining(k_month.get("remaining_seconds", 0))
+                parts.append(f"K月余:{k_pct:.0f}%|{k_str}")
             else:
-                parts.append(f"K5h余:{k_pct:.0f}%|{k_str}")
+                k_sess = kimi_periods.get("session", {})
+                k_pct = k_sess.get("remaining_pct", 0)
+                k_str = fmt_remaining(k_sess.get("remaining_seconds", 0))
+                if k_sess.get("capped_by"):
+                    k_raw = k_sess.get("raw_remaining_pct", 0)
+                    parts.append(f"K5h余:{k_pct:.0f}%(窗口{k_raw:.0f}%)|{k_str}")
+                else:
+                    parts.append(f"K5h余:{k_pct:.0f}%|{k_str}")
         else:
             parts.append("Kimi:未授权")
-        if qwen:
-            qwen_sess = qwen_periods.get("session", {})
-            if qwen_sess:
-                q_pct = qwen_sess.get("remaining_pct", 0)
-                q_str = fmt_remaining(qwen_sess.get("remaining_seconds", 0))
-                parts.append(f"千5h余:{q_pct:.0f}%|{q_str}")
-            else:
-                parts.append("千问:未订阅")
-        else:
-            parts.append("千问:未登录")
         self.setToolTip("  ".join(parts))
         self._update_icon()
 
@@ -1237,7 +1130,7 @@ class ArkMonitorTray(QSystemTrayIcon):
             self.panel.close()
             self.panel = None
 
-        self.panel = UsagePanel(self.data)
+        self.panel = UsagePanel(self.data, icon_level=self._icon_level)
         self.panel.configChanged.connect(lambda: self._refresh(force=True))
         self.panel.showRequested.connect(self._show_panel)
         self.panel._animate_show()

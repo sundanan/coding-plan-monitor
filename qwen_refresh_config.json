@@ -1,7 +1,0 @@
-{
-  "billing_url": "https://platform.qianwenai.com/home/",
-  "profile_dir": "/home/sun/.config/qwen-usage-refresh/profile126",
-  "chromium": "/opt/apps/com.360.browser-stable/files/browser360",
-  "configured_at": 1787056800,
-  "note": "360 浏览器内核为 Chromium 126，可运行工作台 SPA；登录态由 qwen_cookie_import.py 从 360 浏览器导入"
-}

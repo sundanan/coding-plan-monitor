@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """套餐用量 — tray widget entry point.
 
-Volcengine Ark / Kimi Code / Qwen Token Plan quota monitor. The logic lives
+Volcengine Ark / Kimi Code quota monitor. The logic lives
 in monitor_data (fetchers) and monitor_ui (PyQt5 widgets); this module only
 wires them together. It keeps the historical filename because the .desktop
 launchers point at it.
@@ -19,7 +19,6 @@ from monitor_ui import ArkMonitorTray
 from monitor_data import (  # noqa: F401
     load_config, fetch_all_usage, calc_alert, fmt_remaining,
     _fetch_via_sdk, _kimi_ensure_token, _kimi_call_usages,
-    _fetch_qwen_usage_from_cache,
 )
 from monitor_ui import UsagePanel, make_icon_pixmap  # noqa: F401
 
